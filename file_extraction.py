@@ -8,7 +8,6 @@ import boto3
 import os
 from dotenv import load_dotenv
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
 import logging
 from typing import List, Dict
 from boto3.s3.transfer import TransferConfig
@@ -21,7 +20,6 @@ load_dotenv()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 AWS_REGION = os.getenv("AWS_REGION")
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "tesseract")
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.cpu_count()))
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
@@ -84,19 +82,18 @@ def ocr_page(image_path: str) -> str:
     img.close()
     return text
 
-def process_pdf_multiprocess(pdf_path: str, filename: str):
+# Sequential PDF processing (safe for FastAPI)
+def process_pdf_sequential(pdf_path: str, filename: str):
     file_status[filename] = "processing"
     extracted_data: List[Dict[str, str]] = []
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             images = convert_from_path(pdf_path, output_folder=tmpdir, fmt="jpeg", dpi=150)
-            image_paths = [img.filename if hasattr(img, "filename") else img for img in images]
 
-            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                page_texts = list(executor.map(ocr_page, image_paths))
-
-            for text in page_texts:
+            for img in images:
+                img_path = img.filename if hasattr(img, "filename") else img
+                text = ocr_page(img_path)
                 page_keywords = extract_keywords_from_text(text, KEYWORDS)
                 extracted_data.append(page_keywords)
 
@@ -144,7 +141,7 @@ async def upload(file: UploadFile = File(...), background_tasks: BackgroundTasks
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save temp PDF: {str(e)}")
 
-    background_tasks.add_task(process_pdf_multiprocess, tmpfile_path, file.filename)
+    background_tasks.add_task(process_pdf_sequential, tmpfile_path, file.filename)
     return {"message": "File is being processed", "filename": file.filename}
 
 @app.get("/status/{filename}")
