@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+*.sqlite3
+*.egg-info/
+dist/
+build/
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# Tesseract / OCR output
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.txt
+*.json
+
+# AWS / S3 credentials
+*.env
+.aws/
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
