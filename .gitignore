@@ -25,6 +25,7 @@ yarn.lock
 *.jpeg
 *.pdf
 *.txt
+*.json
 
 # AWS / S3 credentials
 *.env
