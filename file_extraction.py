@@ -1,4 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 import pytesseract
 from pdf2image import convert_from_path
 from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError
@@ -24,7 +25,7 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.cpu_count()))
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-# Setup boto3 S3 client
+# S3 client
 s3_client = boto3.client(
     "s3",
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -32,21 +33,31 @@ s3_client = boto3.client(
     region_name=AWS_REGION
 )
 
-# S3 multipart config for large uploads
+# S3 multipart config
 MULTIPART_CONFIG = TransferConfig(
     multipart_threshold=50 * 1024 * 1024,  # 50MB
     max_concurrency=4,
-    multipart_chunksize=25 * 1024 * 1024,  # 25MB
+    multipart_chunksize=25 * 1024 * 1024,
     use_threads=True
 )
 
 app = FastAPI(title="GerakAI PDF Extractor")
 logging.basicConfig(level=logging.INFO)
 
-# In-memory status store
-file_status = {}  # key: filename, value: "processing" | "done" | "failed"
+# Enable CORS for React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Define the keywords to extract
+# In-memory status and results
+file_status: Dict[str, str] = {}
+file_results: Dict[str, Dict] = {}
+
+# Keywords
 KEYWORDS = [
     "Event Type Code", "Capacity", "Estimated Attendance", "Number of Gates",
     "Attendance Ratio", "Parking Capacity", "Nearby Public Transport",
@@ -56,10 +67,8 @@ KEYWORDS = [
     "Celebrity Arrival", "VIP Attending", "Road Closure Expected", "Congestion Risk"
 ]
 
+# Fuzzy keyword extraction
 def extract_keywords_from_text(text: str, keywords: List[str], threshold: int = 70) -> Dict[str, str]:
-    """
-    Extract lines from text that match keywords using fuzzy matching.
-    """
     extracted = {}
     lines = text.split("\n")
     for line in lines:
@@ -69,7 +78,6 @@ def extract_keywords_from_text(text: str, keywords: List[str], threshold: int = 
     return extracted
 
 def ocr_page(image_path: str) -> str:
-    """Run OCR on a single image path"""
     from PIL import Image
     img = Image.open(image_path)
     text = pytesseract.image_to_string(img)
@@ -77,7 +85,6 @@ def ocr_page(image_path: str) -> str:
     return text
 
 def process_pdf_multiprocess(pdf_path: str, filename: str):
-    """Process PDF using multiprocessing, extract keywords, and upload JSON to S3"""
     file_status[filename] = "processing"
     extracted_data: List[Dict[str, str]] = []
 
@@ -86,52 +93,41 @@ def process_pdf_multiprocess(pdf_path: str, filename: str):
             images = convert_from_path(pdf_path, output_folder=tmpdir, fmt="jpeg", dpi=150)
             image_paths = [img.filename if hasattr(img, "filename") else img for img in images]
 
-            # Run OCR using multiprocessing
             with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 page_texts = list(executor.map(ocr_page, image_paths))
 
-            # Extract keywords for each page
             for text in page_texts:
                 page_keywords = extract_keywords_from_text(text, KEYWORDS)
                 extracted_data.append(page_keywords)
 
-    except PDFInfoNotInstalledError:
-        logging.error("pdfinfo not installed. Install poppler for PDF support.")
-        file_status[filename] = "failed"
-        return
-    except PDFPageCountError:
-        logging.error(f"Invalid PDF file: {filename}")
+    except (PDFInfoNotInstalledError, PDFPageCountError) as e:
+        logging.error(f"PDF error: {str(e)}")
         file_status[filename] = "failed"
         return
     except Exception as e:
-        logging.error(f"PDF processing failed for {filename}: {str(e)}")
+        logging.error(f"Processing failed: {str(e)}")
         file_status[filename] = "failed"
         return
 
-    # Convert to JSON
     json_data = {"filename": filename, "pages": extracted_data}
+    file_results[filename] = json_data
 
-    # Remove .pdf extension for S3 key
-    file_base_name = os.path.splitext(filename)[0]
-    s3_key = f"{file_base_name}.json"
-
-    # Upload JSON to S3 (multipart if large)
+    # Upload JSON to S3
     try:
         json_bytes = json.dumps(json_data).encode("utf-8")
         with io.BytesIO(json_bytes) as f:
             s3_client.upload_fileobj(
                 f,
                 Bucket=BUCKET_NAME,
-                Key=s3_key,
+                Key=f"{os.path.splitext(filename)[0]}.json",
                 Config=MULTIPART_CONFIG
             )
-        logging.info(f"Uploaded {s3_key} to S3 successfully.")
+        logging.info(f"Uploaded {filename} to S3 successfully.")
         file_status[filename] = "done"
     except Exception as e:
-        logging.error(f"S3 upload failed for {filename}: {str(e)}")
+        logging.error(f"S3 upload failed: {str(e)}")
         file_status[filename] = "failed"
     finally:
-        # Remove temp PDF
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
 
@@ -148,10 +144,8 @@ async def upload(file: UploadFile = File(...), background_tasks: BackgroundTasks
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save temp PDF: {str(e)}")
 
-    # Add background task for processing
     background_tasks.add_task(process_pdf_multiprocess, tmpfile_path, file.filename)
-
-    return {"message": "File is being processed in background", "filename": file.filename}
+    return {"message": "File is being processed", "filename": file.filename}
 
 @app.get("/status/{filename}")
 async def status(filename: str):
@@ -159,3 +153,10 @@ async def status(filename: str):
     if not status:
         raise HTTPException(status_code=404, detail="File not found")
     return {"filename": filename, "status": status}
+
+@app.get("/results/{filename}")
+async def results(filename: str):
+    result = file_results.get(filename)
+    if not result:
+        raise HTTPException(status_code=404, detail="Results not found")
+    return result
